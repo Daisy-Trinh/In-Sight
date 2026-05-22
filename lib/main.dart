@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'core/api/api_client.dart';
 import 'core/store/app_store.dart';
 import 'core/router/app_router.dart';
 import 'core/theme/app_theme.dart';
@@ -14,13 +15,31 @@ void main() async {
     DeviceOrientation.portraitDown,
   ]);
 
-  // Init store
+  // Init store (generates anonUserId on first run)
   final store = AppStore();
   await store.init();
 
+  // App key — set at build time via --dart-define=IN_SIGHT_APP_KEY=<key>
+  // Must match the APP_KEY secret set in Cloudflare Worker.
+  // Defaults to dev key so local `wrangler dev` works out of the box.
+  const appKey = String.fromEnvironment(
+    'IN_SIGHT_APP_KEY',
+    defaultValue: 'dev-insightapp-2024-local',
+  );
+
+  // isProduction = true only when compiled in release/profile mode
+  final apiClient = ApiClient(
+    appKey: appKey,
+    anonUserId: store.anonUserId,
+    isProduction: const bool.fromEnvironment('dart.vm.product'),
+  );
+
   runApp(
-    ChangeNotifierProvider.value(
-      value: store,
+    MultiProvider(
+      providers: [
+        ChangeNotifierProvider.value(value: store),
+        Provider<ApiClient>.value(value: apiClient),
+      ],
       child: const InSightApp(),
     ),
   );

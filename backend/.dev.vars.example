@@ -1,0 +1,18 @@
+# Local dev secrets — copy to .dev.vars and fill in real values
+# .dev.vars is in .gitignore and is NEVER committed.
+#
+# Usage: wrangler dev reads .dev.vars automatically for local secrets.
+# Reference: https://developers.cloudflare.com/workers/configuration/secrets/#local-development
+
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=AIza...
+
+# Must match IN_SIGHT_APP_KEY dart-define used in flutter build
+APP_KEY=dev-insightapp-2024-local
+
+# Bio prompts (ADR-005: server-side ONLY).
+# In production these are set via `wrangler secret put BIO_*`.
+# Leave empty here to use the DEFAULT_BIOS fallback in index.ts.
+BIO_LAY=
+BIO_MENTOR=
+BIO_SOUL=

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import '../../shared/models/persona.dart';
 import '../theme/design_tokens.dart';
 
@@ -13,6 +14,7 @@ class AppStore extends ChangeNotifier {
   static const _personaKey = 'insight_persona';
   static const _sessionsKey = 'insight_sessions';
   static const _onboardedKey = 'insight_onboarded';
+  static const _anonUserIdKey = 'insight_anon_user_id';
 
   late SharedPreferences _prefs;
   bool _initialized = false;
@@ -25,6 +27,7 @@ class AppStore extends ChangeNotifier {
   Persona _currentPersona = Persona.lay;
   List<JourneySession> _sessions = [];
   bool _hasOnboarded = false;
+  String _anonUserId = '';
 
   // ─────────────────────────────────────────
   // GETTERS
@@ -36,6 +39,9 @@ class AppStore extends ChangeNotifier {
   List<JourneySession> get sessions =>
       List.unmodifiable(_sessions.reversed.toList());
   bool get hasOnboarded => _hasOnboarded;
+  /// Anonymous device ID — generated once per install, never contains PII.
+  /// Used as X-Anon-User-Id header for server-side quota tracking.
+  String get anonUserId => _anonUserId;
 
   // ─────────────────────────────────────────
   // INIT
@@ -47,8 +53,18 @@ class AppStore extends ChangeNotifier {
     _loadPersona();
     _loadSessions();
     _hasOnboarded = _prefs.getBool(_onboardedKey) ?? false;
+    await _loadOrCreateAnonUserId();
     _initialized = true;
     notifyListeners();
+  }
+
+  Future<void> _loadOrCreateAnonUserId() async {
+    var id = _prefs.getString(_anonUserIdKey);
+    if (id == null || id.isEmpty) {
+      id = const Uuid().v4();
+      await _prefs.setString(_anonUserIdKey, id);
+    }
+    _anonUserId = id;
   }
 
   // ─────────────────────────────────────────

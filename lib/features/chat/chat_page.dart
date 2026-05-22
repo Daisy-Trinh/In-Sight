@@ -4,14 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
+import '../../core/api/api_client.dart';
 import '../../core/store/app_store.dart';
 import '../../core/theme/design_tokens.dart';
 import '../../shared/models/persona.dart';
 import '../personas/persona_engine.dart';
-
-// TODO(backend): Replace PersonaEngine with ApiClient.sendChatMessage() when
-// backend is ready. ApiClient is implemented in lib/core/api/api_client.dart
-// and accepts SSE streams. PersonaEngine stays as offline fallback.
 
 class ChatPage extends StatefulWidget {
   final Persona? initialPersona;
@@ -33,6 +30,8 @@ class _ChatPageState extends State<ChatPage> {
   Timer? _topicTimer;
   int _topicCountdown = 10;
   late Persona _persona;
+  // Unique session ID for this chat window — sent as session_id to the API
+  late final String _sessionId;
 
   bool get _isBusy => _isThinking || _isStreaming;
 
@@ -41,6 +40,7 @@ class _ChatPageState extends State<ChatPage> {
     super.initState();
     final store = context.read<AppStore>();
     _persona = widget.initialPersona ?? store.currentPersona;
+    _sessionId = const Uuid().v4();
     _startTopicTimer();
   }
 
@@ -82,16 +82,6 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
 
-    // SOS detection — override persona
-    if (PersonaEngine.detectSOS(text)) {
-      _addMessage(text, isUser: true);
-      await Future.delayed(const Duration(milliseconds: 800));
-      if (!mounted) return;
-      _addMessage(PersonaEngine.sosResponse(), isUser: false);
-      _scrollToBottom();
-      return;
-    }
-
     // Consume token
     store.consumeToken();
 
@@ -104,30 +94,147 @@ class _ChatPageState extends State<ChatPage> {
       _topicTimer?.cancel();
     });
 
-    // Thinking delay (simulate network latency)
-    await Future.delayed(const Duration(milliseconds: 700));
-    if (!mounted) return;
+    // Build history for the API (all messages except the one just added)
+    final history = _messages
+        .sublist(0, _messages.length - 1)
+        .map((m) => <String, String>{
+              'role': m.isUser ? 'user' : 'assistant',
+              'content': m.content,
+            })
+        .toList();
 
-    setState(() {
-      _isThinking = false;
-      _isStreaming = true;
-    });
+    final api = context.read<ApiClient>();
+    bool apiSucceeded = false;
 
-    // Generate responses from PersonaEngine (offline)
-    final responses = PersonaEngine.generateResponse(_persona, text);
+    try {
+      await _streamFromApi(api, text, history, store);
+      apiSucceeded = true;
+    } on ApiException catch (e) {
+      if (e.isQuotaEmpty) {
+        // Server confirmed quota empty — undo local consume and show dialog
+        if (mounted) {
+          setState(() {
+            _isThinking = false;
+            _isStreaming = false;
+          });
+          _showQuotaEmpty();
+        }
+        return;
+      }
+      debugPrint('[Chat] API error ${e.code}: ${e.message}');
+    } catch (e) {
+      debugPrint('[Chat] API unreachable, falling back to PersonaEngine: $e');
+    }
 
-    for (int i = 0; i < responses.length; i++) {
-      await _streamResponse(responses[i]);
-      if (!mounted) return;
-      // Pause between bubbles (Lầy sends 3 separate bubbles)
-      if (i < responses.length - 1) {
+    if (!apiSucceeded && mounted) {
+      // ── Offline fallback — PersonaEngine ──────────────────────────────────
+      // First-time showing: transition to streaming state
+      if (_isThinking) {
+        setState(() {
+          _isThinking = false;
+          _isStreaming = true;
+        });
         await Future.delayed(const Duration(milliseconds: 500));
+      }
+      if (!mounted) return;
+
+      final responses = PersonaEngine.generateResponse(_persona, text);
+      for (int i = 0; i < responses.length; i++) {
+        if (!mounted) return;
+        await _streamResponse(responses[i]);
+        if (i < responses.length - 1) {
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
       }
     }
 
     if (!mounted) return;
-    setState(() => _isStreaming = false);
+    setState(() {
+      _isThinking = false;
+      _isStreaming = false;
+    });
     _scrollToBottom();
+  }
+
+  // ─────────────────────────────────────────
+  // STREAM FROM API (real backend SSE)
+  // ─────────────────────────────────────────
+  Future<void> _streamFromApi(
+    ApiClient api,
+    String text,
+    List<Map<String, String>> history,
+    AppStore store,
+  ) async {
+    final msgId = _uuid.v4();
+    bool messageCreated = false;
+    int deltaCount = 0;
+
+    await for (final event in api.sendChatMessage(
+      persona: _persona,
+      message: text,
+      sessionId: _sessionId,
+      history: history,
+    )) {
+      if (!mounted) return;
+
+      if (event.isChunk) {
+        final delta = event.delta ?? '';
+        if (delta.isEmpty) continue;
+
+        if (!messageCreated) {
+          // First chunk → transition thinking → streaming, create bubble
+          setState(() {
+            _isThinking = false;
+            _isStreaming = true;
+            _messages.add(ChatMessage(
+              id: msgId,
+              content: delta,
+              isUser: false,
+              timestamp: DateTime.now(),
+              isStreaming: true,
+            ));
+          });
+          messageCreated = true;
+          if (!kIsWeb) HapticFeedback.lightImpact();
+          _scrollToBottom();
+        } else {
+          // Subsequent chunks — append delta to existing bubble
+          setState(() {
+            final idx = _messages.indexWhere((m) => m.id == msgId);
+            if (idx >= 0) {
+              _messages[idx] = _messages[idx].copyWith(
+                content: _messages[idx].content + delta,
+              );
+            }
+          });
+          deltaCount++;
+          // Scroll at most every ~15 deltas to avoid scroll storm
+          if (deltaCount % 15 == 0) _scrollToBottom();
+        }
+      } else if (event.isDone) {
+        setState(() {
+          _isStreaming = false;
+          final idx = _messages.indexWhere((m) => m.id == msgId);
+          if (idx >= 0) {
+            _messages[idx] = _messages[idx].copyWith(isStreaming: false);
+          }
+        });
+        if (!kIsWeb) HapticFeedback.selectionClick();
+        _scrollToBottom(animated: true);
+      }
+    }
+
+    // Guard: clean up if stream ended without a 'done' event
+    if (mounted && (_isThinking || _isStreaming)) {
+      setState(() {
+        _isThinking = false;
+        _isStreaming = false;
+        final idx = _messages.indexWhere((m) => m.id == msgId);
+        if (idx >= 0) {
+          _messages[idx] = _messages[idx].copyWith(isStreaming: false);
+        }
+      });
+    }
   }
 
   /// Streams [fullText] character-by-character into a new bot message bubble.
