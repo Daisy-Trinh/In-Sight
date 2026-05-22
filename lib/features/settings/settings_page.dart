@@ -269,7 +269,7 @@ class _SettingsTile extends StatelessWidget {
         margin: const EdgeInsets.only(bottom: DesignTokens.space8),
         padding: const EdgeInsets.symmetric(
           horizontal: DesignTokens.space16,
-          vertical: DesignTokens.space14,
+          vertical: 14.0,
         ),
         decoration: BoxDecoration(
           color: Theme.of(context).colorScheme.surface,
@@ -386,7 +386,3 @@ class _CascadeWipeDialogState extends State<_CascadeWipeDialog> {
   }
 }
 
-// Hack: DesignTokens.space14 doesn't exist — patch
-extension _SpacePatch on DesignTokens {
-  static const double space14 = 14.0;
-}

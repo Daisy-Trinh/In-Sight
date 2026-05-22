@@ -46,3 +46,19 @@ app.*.map.json
 *.keystore
 google-services.json
 GoogleService-Info.plist
+
+# Android local config
+android/local.properties
+
+# iOS Pods
+**/Pods/
+**/ios/.symlinks/
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Runner/GeneratedPluginRegistrant.*
+
+# Windows ephemeral
+windows/flutter/ephemeral/
+
+# macOS ephemeral
+**/macos/Flutter/ephemeral/
