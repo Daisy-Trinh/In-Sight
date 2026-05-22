@@ -23,7 +23,7 @@ class _ChatPageState extends State<ChatPage> {
   final ScrollController _scrollCtrl = ScrollController();
   final _uuid = const Uuid();
 
-  List<ChatMessage> _messages = [];
+  final List<ChatMessage> _messages = [];
   bool _isThinking = false; // true while waiting for first response chunk
   bool _isStreaming = false; // true while a message is being typed out
   bool _showTopics = true;
@@ -32,6 +32,10 @@ class _ChatPageState extends State<ChatPage> {
   late Persona _persona;
   // Unique session ID for this chat window — sent as session_id to the API
   late final String _sessionId;
+
+  // Tracks IDs of the most-recent failed send so _retryLastMessage can remove them
+  String? _lastUserMsgId;
+  String? _lastErrorBubbleId;
 
   bool get _isBusy => _isThinking || _isStreaming;
 
@@ -82,13 +86,20 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
 
-    // Consume token
+    // Pre-consume token — refunded in all catch blocks below
     store.consumeToken();
 
-    // Add user message + clear input
+    // Add user message + clear input; remember ID for potential retry
     _textCtrl.clear();
-    _addMessage(text, isUser: true);
+    final userMsgId = _uuid.v4();
+    _lastUserMsgId = userMsgId;
     setState(() {
+      _messages.add(ChatMessage(
+        id: userMsgId,
+        content: text,
+        isUser: true,
+        timestamp: DateTime.now(),
+      ));
       _isThinking = true;
       _showTopics = false;
       _topicTimer?.cancel();
@@ -104,56 +115,104 @@ class _ChatPageState extends State<ChatPage> {
         .toList();
 
     final api = context.read<ApiClient>();
-    bool apiSucceeded = false;
 
     try {
-      await _streamFromApi(api, text, history, store);
-      apiSucceeded = true;
-    } on ApiException catch (e) {
-      if (e.isQuotaEmpty) {
-        // Server confirmed quota empty — undo local consume and show dialog
-        if (mounted) {
-          setState(() {
-            _isThinking = false;
-            _isStreaming = false;
-          });
-          _showQuotaEmpty();
-        }
-        return;
-      }
-      debugPrint('[Chat] API error ${e.code}: ${e.message}');
-    } catch (e) {
-      debugPrint('[Chat] API unreachable, falling back to PersonaEngine: $e');
-    }
-
-    if (!apiSucceeded && mounted) {
-      // ── Offline fallback — PersonaEngine ──────────────────────────────────
-      // First-time showing: transition to streaming state
-      if (_isThinking) {
-        setState(() {
-          _isThinking = false;
-          _isStreaming = true;
-        });
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
+      await _streamFromApi(api, text, history);
+      // ── Success ───────────────────────────────────────────────────────────
       if (!mounted) return;
-
-      final responses = PersonaEngine.generateResponse(_persona, text);
-      for (int i = 0; i < responses.length; i++) {
-        if (!mounted) return;
-        await _streamResponse(responses[i]);
-        if (i < responses.length - 1) {
-          await Future.delayed(const Duration(milliseconds: 500));
-        }
+      setState(() {
+        _isThinking = false;
+        _isStreaming = false;
+      });
+      _scrollToBottom();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _resetBusyState();
+      if (e.isQuotaEmpty) {
+        store.refundToken();
+        _showQuotaEmpty();
+      } else {
+        debugPrint('[Chat] API error ${e.code}: ${e.message}');
+        store.refundToken();
+        _showApiError(text);
       }
+    } catch (e) {
+      if (!mounted) return;
+      _resetBusyState();
+      debugPrint('[Chat] API unreachable: $e');
+      store.refundToken();
+      _showApiError(text);
     }
+  }
 
+  // ─────────────────────────────────────────
+  // HELPERS
+  // ─────────────────────────────────────────
+
+  /// Reset thinking/streaming flags and finalize any partial bot bubble.
+  void _resetBusyState() {
     if (!mounted) return;
     setState(() {
       _isThinking = false;
       _isStreaming = false;
+      // Finalize any partial streaming bubble left by a failed stream
+      final partialIdx = _messages.lastIndexWhere((m) => !m.isUser && m.isStreaming);
+      if (partialIdx >= 0) {
+        _messages[partialIdx] = _messages[partialIdx].copyWith(isStreaming: false);
+      }
+    });
+  }
+
+  /// Show an inline error bubble + SnackBar with a retry action.
+  void _showApiError(String failedText) {
+    if (!mounted) return;
+
+    final errorId = _uuid.v4();
+    _lastErrorBubbleId = errorId;
+
+    setState(() {
+      _messages.add(ChatMessage(
+        id: errorId,
+        content: '⚡ AI đang bận, tin nhắn chưa đến được. Nhấn "Thử lại" để gửi lại.',
+        isUser: false,
+        timestamp: DateTime.now(),
+      ));
     });
     _scrollToBottom();
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: const Text('Không kết nối được với AI'),
+          backgroundColor: Colors.red.shade700,
+          behavior: SnackBarBehavior.floating,
+          action: SnackBarAction(
+            label: 'Thử lại',
+            textColor: Colors.white,
+            onPressed: () => _retryLastMessage(failedText),
+          ),
+          duration: const Duration(seconds: 8),
+        ),
+      );
+  }
+
+  /// Remove the error bubble + the failed user message, then re-send.
+  void _retryLastMessage(String failedText) {
+    if (_isBusy) return;
+    setState(() {
+      // Remove error bubble
+      if (_lastErrorBubbleId != null) {
+        _messages.removeWhere((m) => m.id == _lastErrorBubbleId);
+        _lastErrorBubbleId = null;
+      }
+      // Remove the failed user message
+      if (_lastUserMsgId != null) {
+        _messages.removeWhere((m) => m.id == _lastUserMsgId);
+        _lastUserMsgId = null;
+      }
+    });
+    _sendMessage(failedText);
   }
 
   // ─────────────────────────────────────────
@@ -163,156 +222,91 @@ class _ChatPageState extends State<ChatPage> {
     ApiClient api,
     String text,
     List<Map<String, String>> history,
-    AppStore store,
   ) async {
     final msgId = _uuid.v4();
     bool messageCreated = false;
     int deltaCount = 0;
 
-    await for (final event in api.sendChatMessage(
-      persona: _persona,
-      message: text,
-      sessionId: _sessionId,
-      history: history,
-    )) {
-      if (!mounted) return;
+    try {
+      await for (final event in api.sendChatMessage(
+        persona: _persona,
+        message: text,
+        sessionId: _sessionId,
+        history: history,
+      )) {
+        if (!mounted) return;
 
-      if (event.isChunk) {
-        final delta = event.delta ?? '';
-        if (delta.isEmpty) continue;
+        if (event.isChunk) {
+          final delta = event.delta ?? '';
+          if (delta.isEmpty) continue;
 
-        if (!messageCreated) {
-          // First chunk → transition thinking → streaming, create bubble
+          if (!messageCreated) {
+            // First chunk → transition thinking → streaming, create bubble
+            setState(() {
+              _isThinking = false;
+              _isStreaming = true;
+              _messages.add(ChatMessage(
+                id: msgId,
+                content: delta,
+                isUser: false,
+                timestamp: DateTime.now(),
+                isStreaming: true,
+              ));
+            });
+            messageCreated = true;
+            if (!kIsWeb) HapticFeedback.lightImpact();
+            _scrollToBottom();
+          } else {
+            // Subsequent chunks — append delta to existing bubble
+            setState(() {
+              final idx = _messages.indexWhere((m) => m.id == msgId);
+              if (idx >= 0) {
+                _messages[idx] = _messages[idx].copyWith(
+                  content: _messages[idx].content + delta,
+                );
+              }
+            });
+            deltaCount++;
+            // Scroll at most every ~15 deltas to avoid scroll storm
+            if (deltaCount % 15 == 0) _scrollToBottom();
+          }
+        } else if (event.isDone) {
+          if (!mounted) return;
           setState(() {
-            _isThinking = false;
-            _isStreaming = true;
-            _messages.add(ChatMessage(
-              id: msgId,
-              content: delta,
-              isUser: false,
-              timestamp: DateTime.now(),
-              isStreaming: true,
-            ));
-          });
-          messageCreated = true;
-          if (!kIsWeb) HapticFeedback.lightImpact();
-          _scrollToBottom();
-        } else {
-          // Subsequent chunks — append delta to existing bubble
-          setState(() {
+            _isStreaming = false;
             final idx = _messages.indexWhere((m) => m.id == msgId);
             if (idx >= 0) {
-              _messages[idx] = _messages[idx].copyWith(
-                content: _messages[idx].content + delta,
-              );
+              _messages[idx] = _messages[idx].copyWith(isStreaming: false);
             }
           });
-          deltaCount++;
-          // Scroll at most every ~15 deltas to avoid scroll storm
-          if (deltaCount % 15 == 0) _scrollToBottom();
+          if (!kIsWeb) HapticFeedback.selectionClick();
+          _scrollToBottom(animated: true);
         }
-      } else if (event.isDone) {
+      }
+
+      // Guard: stream ended without a 'done' event (e.g. server closed early)
+      if (mounted && (_isThinking || _isStreaming)) {
         setState(() {
+          _isThinking = false;
           _isStreaming = false;
           final idx = _messages.indexWhere((m) => m.id == msgId);
           if (idx >= 0) {
             _messages[idx] = _messages[idx].copyWith(isStreaming: false);
           }
         });
-        if (!kIsWeb) HapticFeedback.selectionClick();
-        _scrollToBottom(animated: true);
       }
+    } catch (e) {
+      // Stream threw (network error, timeout, DNS failure, etc.).
+      // Clean up any partial bubble so _showApiError can show a clean error.
+      if (mounted) {
+        setState(() {
+          _isThinking = false;
+          _isStreaming = false;
+          _messages.removeWhere((m) => m.id == msgId);
+        });
+      }
+      rethrow; // propagate to _sendMessage catch block
     }
-
-    // Guard: clean up if stream ended without a 'done' event
-    if (mounted && (_isThinking || _isStreaming)) {
-      setState(() {
-        _isThinking = false;
-        _isStreaming = false;
-        final idx = _messages.indexWhere((m) => m.id == msgId);
-        if (idx >= 0) {
-          _messages[idx] = _messages[idx].copyWith(isStreaming: false);
-        }
-      });
-    }
-  }
-
-  /// Streams [fullText] character-by-character into a new bot message bubble.
-  /// FIX: tracks message by ID (not _messages.last) and limits setState/scroll
-  /// calls to prevent the "setState storm + scroll animation storm" crash.
-  Future<void> _streamResponse(String fullText) async {
-    if (!mounted) return;
-
-    // Add an empty bot message and remember its ID
-    final msgId = _uuid.v4();
-    setState(() {
-      _messages.add(ChatMessage(
-        id: msgId,
-        content: '',
-        isUser: false,
-        timestamp: DateTime.now(),
-        isStreaming: true,
-      ));
-    });
-    _scrollToBottom();
-
-    // Stream in chunks of 3 chars every 28ms instead of 1 char every 18ms.
-    // This reduces setState calls by ~3× while keeping the same visual speed.
-    const chunkSize = 3;
-    const tickMs = 28;
-
-    String built = '';
-    for (int i = 0; i < fullText.length; i += chunkSize) {
-      await Future.delayed(const Duration(milliseconds: tickMs));
-      if (!mounted) return;
-
-      final end = (i + chunkSize).clamp(0, fullText.length);
-      built = fullText.substring(0, end);
-      final done = end >= fullText.length;
-
-      // FIX: find by ID, not _messages.last
-      setState(() {
-        final idx = _messages.indexWhere((m) => m.id == msgId);
-        if (idx >= 0) {
-          _messages[idx] = _messages[idx].copyWith(
-            content: built,
-            isStreaming: !done,
-          );
-        }
-      });
-
-      // Haptic on first chunk only
-      if (i == 0 && !kIsWeb) {
-        HapticFeedback.lightImpact();
-      }
-
-      // FIX: scroll at most once every ~300ms (every ~10 ticks) to avoid
-      // flooding addPostFrameCallback with hundreds of competing animateTo calls
-      if (i % (chunkSize * 10) == 0 || done) {
-        _scrollToBottom();
-      }
-    }
-
-    // Ensure finalized state
-    setState(() {
-      final idx = _messages.indexWhere((m) => m.id == msgId);
-      if (idx >= 0) {
-        _messages[idx] = _messages[idx].copyWith(isStreaming: false);
-      }
-    });
-
-    if (!kIsWeb) HapticFeedback.selectionClick();
-  }
-
-  void _addMessage(String content, {required bool isUser}) {
-    setState(() {
-      _messages.add(ChatMessage(
-        id: _uuid.v4(),
-        content: content,
-        isUser: isUser,
-        timestamp: DateTime.now(),
-      ));
-    });
   }
 
   /// FIX: use jumpTo during streaming (no animation = no competing animateTo

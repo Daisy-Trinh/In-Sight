@@ -112,6 +112,22 @@ class AppStore extends ChangeNotifier {
     return true;
   }
 
+  /// Refund 1 token — call when an API request fails after pre-consuming.
+  /// No-op for premium (unlimited) users.
+  void refundToken() {
+    if (_quota.isPremium) return;
+    _quota = QuotaStatus(
+      tokensRemaining: _quota.tokensRemaining + 1,
+      tokensGranted: _quota.tokensGranted,
+      adGrants: _quota.adGrants,
+      isPremium: _quota.isPremium,
+      resetsAt: _quota.resetsAt,
+      quotaDate: _quota.quotaDate,
+    );
+    _saveQuota();
+    notifyListeners();
+  }
+
   /// Grant ad reward tokens (+10)
   void grantAdReward() {
     _quota = QuotaStatus(

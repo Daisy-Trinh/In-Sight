@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'core/api/api_client.dart';
 import 'core/store/app_store.dart';
@@ -45,27 +46,51 @@ void main() async {
   );
 }
 
-class InSightApp extends StatelessWidget {
+/// InSightApp MUST be a StatefulWidget so that the GoRouter is created
+/// exactly once in initState().
+///
+/// If it were a StatelessWidget, every store.notifyListeners() call (e.g.
+/// consumeToken) would trigger build(), which would call AppRouter.router()
+/// again, producing a brand-new GoRouter with initialLocation: '/' — causing
+/// the app to navigate back to Splash on every token consume. (DEFECT-WEB-01)
+class InSightApp extends StatefulWidget {
   const InSightApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final store = context.watch<AppStore>();
+  State<InSightApp> createState() => _InSightAppState();
+}
 
-    // Router depends on store state (onboarded flag)
-    final router = AppRouter.router(store);
+class _InSightAppState extends State<InSightApp> {
+  late final GoRouter _router;
+
+  @override
+  void initState() {
+    super.initState();
+    // Read store once — the redirect closure holds a reference, so it always
+    // sees the current store state even though the router is never recreated.
+    final store = context.read<AppStore>();
+    _router = AppRouter.router(store);
+  }
+
+  @override
+  void dispose() {
+    _router.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // watch() only for fields that legitimately need reactive updates.
+    // It no longer recreates the router.
+    final store = context.watch<AppStore>();
 
     return MaterialApp.router(
       title: 'In-Sight',
       debugShowCheckedModeBanner: false,
-
-      // Theme — switch based on store.isDarkMode
       theme: AppTheme.light,
       darkTheme: AppTheme.dark,
       themeMode: store.isDarkMode ? ThemeMode.dark : ThemeMode.light,
-
-      // Routing
-      routerConfig: router,
+      routerConfig: _router,
     );
   }
 }
