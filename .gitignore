@@ -62,3 +62,6 @@ windows/flutter/ephemeral/
 
 # macOS ephemeral
 **/macos/Flutter/ephemeral/
+
+.vercel
+.env*
