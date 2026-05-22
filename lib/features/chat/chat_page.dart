@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -7,6 +8,10 @@ import '../../core/store/app_store.dart';
 import '../../core/theme/design_tokens.dart';
 import '../../shared/models/persona.dart';
 import '../personas/persona_engine.dart';
+
+// TODO(backend): Replace PersonaEngine with ApiClient.sendChatMessage() when
+// backend is ready. ApiClient is implemented in lib/core/api/api_client.dart
+// and accepts SSE streams. PersonaEngine stays as offline fallback.
 
 class ChatPage extends StatefulWidget {
   final Persona? initialPersona;
@@ -22,12 +27,14 @@ class _ChatPageState extends State<ChatPage> {
   final _uuid = const Uuid();
 
   List<ChatMessage> _messages = [];
-  bool _isTyping = false;
-  String _streamingText = '';
+  bool _isThinking = false; // true while waiting for first response chunk
+  bool _isStreaming = false; // true while a message is being typed out
   bool _showTopics = true;
   Timer? _topicTimer;
   int _topicCountdown = 10;
   late Persona _persona;
+
+  bool get _isBusy => _isThinking || _isStreaming;
 
   @override
   void initState() {
@@ -49,10 +56,7 @@ class _ChatPageState extends State<ChatPage> {
     _topicCountdown = 10;
     _topicTimer?.cancel();
     _topicTimer = Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted) {
-        t.cancel();
-        return;
-      }
+      if (!mounted) { t.cancel(); return; }
       setState(() {
         _topicCountdown--;
         if (_topicCountdown <= 0) {
@@ -68,7 +72,7 @@ class _ChatPageState extends State<ChatPage> {
   // ─────────────────────────────────────────
   Future<void> _sendMessage([String? overrideText]) async {
     final text = (overrideText ?? _textCtrl.text).trim();
-    if (text.isEmpty || _isTyping) return;
+    if (text.isEmpty || _isBusy) return;
 
     final store = context.read<AppStore>();
 
@@ -78,73 +82,119 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
 
-    // SOS detection
+    // SOS detection — override persona
     if (PersonaEngine.detectSOS(text)) {
       _addMessage(text, isUser: true);
       await Future.delayed(const Duration(milliseconds: 800));
+      if (!mounted) return;
       _addMessage(PersonaEngine.sosResponse(), isUser: false);
+      _scrollToBottom();
       return;
     }
 
     // Consume token
     store.consumeToken();
 
-    // Add user message
-    _addMessage(text, isUser: true);
+    // Add user message + clear input
     _textCtrl.clear();
+    _addMessage(text, isUser: true);
     setState(() {
-      _isTyping = true;
+      _isThinking = true;
       _showTopics = false;
       _topicTimer?.cancel();
-      _streamingText = '';
     });
 
-    // Simulate streaming response
+    // Thinking delay (simulate network latency)
+    await Future.delayed(const Duration(milliseconds: 700));
+    if (!mounted) return;
+
+    setState(() {
+      _isThinking = false;
+      _isStreaming = true;
+    });
+
+    // Generate responses from PersonaEngine (offline)
     final responses = PersonaEngine.generateResponse(_persona, text);
-    for (final response in responses) {
-      await _streamResponse(response);
-      if (responses.indexOf(response) < responses.length - 1) {
-        await Future.delayed(const Duration(milliseconds: 400));
+
+    for (int i = 0; i < responses.length; i++) {
+      await _streamResponse(responses[i]);
+      if (!mounted) return;
+      // Pause between bubbles (Lầy sends 3 separate bubbles)
+      if (i < responses.length - 1) {
+        await Future.delayed(const Duration(milliseconds: 500));
       }
     }
 
-    setState(() => _isTyping = false);
+    if (!mounted) return;
+    setState(() => _isStreaming = false);
     _scrollToBottom();
   }
 
+  /// Streams [fullText] character-by-character into a new bot message bubble.
+  /// FIX: tracks message by ID (not _messages.last) and limits setState/scroll
+  /// calls to prevent the "setState storm + scroll animation storm" crash.
   Future<void> _streamResponse(String fullText) async {
+    if (!mounted) return;
+
+    // Add an empty bot message and remember its ID
+    final msgId = _uuid.v4();
     setState(() {
-      _streamingText = '';
       _messages.add(ChatMessage(
-        id: _uuid.v4(),
+        id: msgId,
         content: '',
         isUser: false,
         timestamp: DateTime.now(),
         isStreaming: true,
       ));
     });
+    _scrollToBottom();
 
-    // Stream character by character with haptic
-    for (int i = 0; i < fullText.length; i++) {
-      await Future.delayed(const Duration(milliseconds: 18));
+    // Stream in chunks of 3 chars every 28ms instead of 1 char every 18ms.
+    // This reduces setState calls by ~3× while keeping the same visual speed.
+    const chunkSize = 3;
+    const tickMs = 28;
+
+    String built = '';
+    for (int i = 0; i < fullText.length; i += chunkSize) {
+      await Future.delayed(const Duration(milliseconds: tickMs));
       if (!mounted) return;
+
+      final end = (i + chunkSize).clamp(0, fullText.length);
+      built = fullText.substring(0, end);
+      final done = end >= fullText.length;
+
+      // FIX: find by ID, not _messages.last
       setState(() {
-        _streamingText = fullText.substring(0, i + 1);
-        _messages.last = _messages.last.copyWith(
-          content: _streamingText,
-          isStreaming: i < fullText.length - 1,
-        );
+        final idx = _messages.indexWhere((m) => m.id == msgId);
+        if (idx >= 0) {
+          _messages[idx] = _messages[idx].copyWith(
+            content: built,
+            isStreaming: !done,
+          );
+        }
       });
-      if (i == 0) HapticFeedback.lightImpact();
-      _scrollToBottom();
+
+      // Haptic on first chunk only
+      if (i == 0 && !kIsWeb) {
+        HapticFeedback.lightImpact();
+      }
+
+      // FIX: scroll at most once every ~300ms (every ~10 ticks) to avoid
+      // flooding addPostFrameCallback with hundreds of competing animateTo calls
+      if (i % (chunkSize * 10) == 0 || done) {
+        _scrollToBottom();
+      }
     }
 
-    // Finalize
+    // Ensure finalized state
     setState(() {
-      _messages.last = _messages.last.copyWith(isStreaming: false);
-      _streamingText = '';
+      final idx = _messages.indexWhere((m) => m.id == msgId);
+      if (idx >= 0) {
+        _messages[idx] = _messages[idx].copyWith(isStreaming: false);
+      }
     });
-    HapticFeedback.selectionClick();
+
+    if (!kIsWeb) HapticFeedback.selectionClick();
   }
 
   void _addMessage(String content, {required bool isUser}) {
@@ -156,17 +206,22 @@ class _ChatPageState extends State<ChatPage> {
         timestamp: DateTime.now(),
       ));
     });
-    _scrollToBottom();
   }
 
-  void _scrollToBottom() {
+  /// FIX: use jumpTo during streaming (no animation = no competing animateTo
+  /// calls stacking up). Only animate on explicit user-facing scrolls.
+  void _scrollToBottom({bool animated = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollCtrl.hasClients) {
+      if (!mounted || !_scrollCtrl.hasClients) return;
+      final max = _scrollCtrl.position.maxScrollExtent;
+      if (animated) {
         _scrollCtrl.animateTo(
-          _scrollCtrl.position.maxScrollExtent,
+          max,
           duration: DesignTokens.durationNormal,
           curve: Curves.easeOut,
         );
+      } else {
+        _scrollCtrl.jumpTo(max);
       }
     });
   }
@@ -185,7 +240,6 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _simulateAdReward() async {
-    // Production: gọi AdMob Rewarded Ad + API /quota/reward
     await Future.delayed(const Duration(seconds: 2));
     if (!mounted) return;
     context.read<AppStore>().grantAdReward();
@@ -223,9 +277,15 @@ class _ChatPageState extends State<ChatPage> {
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
                 Text(
-                  'đang online',
+                  _isThinking
+                      ? 'đang suy nghĩ...'
+                      : _isStreaming
+                          ? 'đang gõ...'
+                          : 'đang online',
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: DesignTokens.success,
+                        color: (_isThinking || _isStreaming)
+                            ? personaColor
+                            : DesignTokens.success,
                       ),
                 ),
               ],
@@ -233,10 +293,8 @@ class _ChatPageState extends State<ChatPage> {
           ],
         ),
         actions: [
-          // Quota indicator
           Padding(
-            padding:
-                const EdgeInsets.only(right: DesignTokens.space16),
+            padding: const EdgeInsets.only(right: DesignTokens.space16),
             child: _QuotaChip(quota: store.quota),
           ),
         ],
@@ -270,13 +328,16 @@ class _ChatPageState extends State<ChatPage> {
                   ),
           ),
 
-          // Typing indicator
-          if (_isTyping) _TypingIndicator(personaColor: personaColor),
+          // Typing indicator — only shown while thinking, not while streaming
+          // (streaming message already shows the bubble being typed)
+          if (_isThinking)
+            _TypingIndicator(personaColor: personaColor),
 
           // Input bar
           _InputBar(
             controller: _textCtrl,
             onSend: () => _sendMessage(),
+            isBusy: _isBusy,
             personaColor: personaColor,
           ),
         ],
@@ -295,12 +356,9 @@ class _PersonaAvatar extends StatelessWidget {
 
   String get _emoji {
     switch (persona) {
-      case Persona.lay:
-        return '😎';
-      case Persona.mentor:
-        return '🧠';
-      case Persona.soul:
-        return '🌙';
+      case Persona.lay:    return '😎';
+      case Persona.mentor: return '🧠';
+      case Persona.soul:   return '🌙';
     }
   }
 
@@ -324,7 +382,7 @@ class _QuotaChip extends StatelessWidget {
 
   Color get _color {
     if (quota.isEmpty) return DesignTokens.error;
-    if (quota.isLow) return DesignTokens.warning;
+    if (quota.isLow)   return DesignTokens.warning;
     return DesignTokens.primary;
   }
 
@@ -397,12 +455,9 @@ class _EmptyChat extends StatelessWidget {
 
   String get _greeting {
     switch (persona) {
-      case Persona.lay:
-        return 'hey! có chuyện gì không? 👀';
-      case Persona.mentor:
-        return 'Chào bạn. Hôm nay bạn muốn khám phá điều gì?';
-      case Persona.soul:
-        return 'Tôi ở đây. Cứ chia sẻ khi bạn sẵn sàng 🌙';
+      case Persona.lay:    return 'hey! có chuyện gì không? 👀';
+      case Persona.mentor: return 'Chào bạn. Hôm nay bạn muốn khám phá điều gì?';
+      case Persona.soul:   return 'Tôi ở đây. Cứ chia sẻ khi bạn sẵn sàng 🌙';
     }
   }
 
@@ -448,8 +503,7 @@ class _EmptyChat extends StatelessWidget {
               ),
               const SizedBox(height: DesignTokens.space8),
               ...topics.map((topic) => Padding(
-                    padding:
-                        const EdgeInsets.only(bottom: DesignTokens.space8),
+                    padding: const EdgeInsets.only(bottom: DesignTokens.space8),
                     child: GestureDetector(
                       onTap: () => onTopicTap(topic),
                       child: Container(
@@ -467,10 +521,10 @@ class _EmptyChat extends StatelessWidget {
                         ),
                         child: Text(
                           topic,
-                          style:
-                              Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                    color: DesignTokens.textPrimary,
-                                  ),
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodyMedium
+                              ?.copyWith(color: DesignTokens.textPrimary),
                         ),
                       ),
                     ),
@@ -513,11 +567,8 @@ class _MessageBubble extends StatelessWidget {
                 borderRadius: BorderRadius.circular(DesignTokens.radiusSm),
               ),
               child: Center(
-                child: Icon(
-                  Icons.smart_toy_outlined,
-                  size: 16,
-                  color: personaColor,
-                ),
+                child: Icon(Icons.smart_toy_outlined,
+                    size: 16, color: personaColor),
               ),
             ),
             const SizedBox(width: DesignTokens.space8),
@@ -531,8 +582,10 @@ class _MessageBubble extends StatelessWidget {
               decoration: BoxDecoration(
                 color: isUser ? DesignTokens.primary : personaContainer,
                 borderRadius: BorderRadius.only(
-                  topLeft: const Radius.circular(DesignTokens.radiusLg),
-                  topRight: const Radius.circular(DesignTokens.radiusLg),
+                  topLeft:
+                      const Radius.circular(DesignTokens.radiusLg),
+                  topRight:
+                      const Radius.circular(DesignTokens.radiusLg),
                   bottomLeft: Radius.circular(
                       isUser ? DesignTokens.radiusLg : DesignTokens.radiusXs),
                   bottomRight: Radius.circular(
@@ -542,15 +595,22 @@ class _MessageBubble extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    message.content,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: isUser
-                              ? DesignTokens.onPrimary
-                              : DesignTokens.textPrimary,
-                        ),
-                  ),
-                  if (message.isStreaming) ...[
+                  // Empty streaming bubble shows cursor only
+                  if (message.content.isEmpty && message.isStreaming)
+                    _StreamingCursor(color: personaColor)
+                  else
+                    Text(
+                      message.content,
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodyMedium
+                          ?.copyWith(
+                            color: isUser
+                                ? DesignTokens.onPrimary
+                                : DesignTokens.textPrimary,
+                          ),
+                    ),
+                  if (message.content.isNotEmpty && message.isStreaming) ...[
                     const SizedBox(height: 4),
                     _StreamingCursor(color: personaColor),
                   ],
@@ -637,9 +697,7 @@ class _TypingIndicatorState extends State<_TypingIndicator>
 
   @override
   void dispose() {
-    for (final c in _controllers) {
-      c.dispose();
-    }
+    for (final c in _controllers) c.dispose();
     super.dispose();
   }
 
@@ -693,11 +751,13 @@ class _TypingIndicatorState extends State<_TypingIndicator>
 class _InputBar extends StatelessWidget {
   final TextEditingController controller;
   final VoidCallback onSend;
+  final bool isBusy;
   final Color personaColor;
 
   const _InputBar({
     required this.controller,
     required this.onSend,
+    required this.isBusy,
     required this.personaColor,
   });
 
@@ -708,16 +768,12 @@ class _InputBar extends StatelessWidget {
         left: DesignTokens.space16,
         right: DesignTokens.space16,
         top: DesignTokens.space12,
-        bottom: DesignTokens.space12 +
-            MediaQuery.of(context).padding.bottom,
+        bottom: DesignTokens.space12 + MediaQuery.of(context).padding.bottom,
       ),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
         border: Border(
-          top: BorderSide(
-            color: DesignTokens.outlineVariant,
-            width: 1,
-          ),
+          top: BorderSide(color: DesignTokens.outlineVariant, width: 1),
         ),
       ),
       child: Row(
@@ -727,13 +783,16 @@ class _InputBar extends StatelessWidget {
               controller: controller,
               maxLines: 4,
               minLines: 1,
+              enabled: !isBusy,
               textCapitalization: TextCapitalization.sentences,
-              decoration: const InputDecoration(
-                hintText: 'Nhắn gì đó...',
+              onSubmitted: isBusy ? null : (_) => onSend(),
+              decoration: InputDecoration(
+                hintText: isBusy ? 'Đang trả lời...' : 'Nhắn gì đó...',
                 border: InputBorder.none,
                 enabledBorder: InputBorder.none,
                 focusedBorder: InputBorder.none,
-                contentPadding: EdgeInsets.symmetric(
+                disabledBorder: InputBorder.none,
+                contentPadding: const EdgeInsets.symmetric(
                   horizontal: DesignTokens.space16,
                   vertical: DesignTokens.space12,
                 ),
@@ -744,18 +803,33 @@ class _InputBar extends StatelessWidget {
           ),
           const SizedBox(width: DesignTokens.space8),
           GestureDetector(
-            onTap: onSend,
-            child: Container(
+            onTap: isBusy ? null : onSend,
+            child: AnimatedContainer(
+              duration: DesignTokens.durationNormal,
               width: 44,
               height: 44,
               decoration: BoxDecoration(
-                color: personaColor,
-                borderRadius: BorderRadius.circular(DesignTokens.radiusFull),
+                color: isBusy
+                    ? personaColor.withOpacity(0.4)
+                    : personaColor,
+                borderRadius:
+                    BorderRadius.circular(DesignTokens.radiusFull),
               ),
-              child: const Icon(
-                Icons.send_rounded,
-                color: Colors.white,
-                size: 20,
+              child: Center(
+                child: isBusy
+                    ? SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white.withOpacity(0.8),
+                        ),
+                      )
+                    : const Icon(
+                        Icons.send_rounded,
+                        color: Colors.white,
+                        size: 20,
+                      ),
               ),
             ),
           ),

@@ -1,6 +1,5 @@
 {
   "version": 2,
-  "name": "in-sight",
   "outputDirectory": "build/web",
   "builds": [
     {
