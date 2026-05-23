@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 import '../../core/api/api_client.dart';
@@ -279,6 +280,8 @@ class _ChatPageState extends State<ChatPage> {
               _messages[idx] = _messages[idx].copyWith(isStreaming: false);
             }
           });
+          // WEB-10: split Lay roast into 3 bubbles on ||| separator
+          _splitRoastBubbles(msgId);
           if (!kIsWeb) HapticFeedback.selectionClick();
           _scrollToBottom(animated: true);
         }
@@ -307,6 +310,43 @@ class _ChatPageState extends State<ChatPage> {
       }
       rethrow; // propagate to _sendMessage catch block
     }
+  }
+
+  // ─────────────────────────────────────────
+  // WEB-10: ROAST BUBBLE SPLIT
+  // ─────────────────────────────────────────
+  /// After a stream completes, if the bot message contains "||| " separators
+  /// (Lay persona roast format), replace it with multiple individual bubbles.
+  void _splitRoastBubbles(String msgId) {
+    final idx = _messages.indexWhere((m) => m.id == msgId);
+    if (idx < 0) return;
+
+    final raw = _messages[idx].content;
+    if (!raw.contains('|||')) return;
+
+    final parts = raw
+        .split('|||')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
+    if (parts.length <= 1) return;
+
+    setState(() {
+      // Replace original with first part, insert rest after it
+      _messages[idx] = _messages[idx].copyWith(content: parts[0]);
+      for (int i = 1; i < parts.length; i++) {
+        _messages.insert(
+          idx + i,
+          ChatMessage(
+            id: _uuid.v4(),
+            content: parts[i],
+            isUser: false,
+            timestamp: DateTime.now(),
+            isStreaming: false,
+          ),
+        );
+      }
+    });
   }
 
   /// FIX: use jumpTo during streaming (no animation = no competing animateTo
@@ -699,6 +739,33 @@ class _MessageBubble extends StatelessWidget {
                   // Empty streaming bubble shows cursor only
                   if (message.content.isEmpty && message.isStreaming)
                     _StreamingCursor(color: personaColor)
+                  // WEB-11: completed bot message → render markdown
+                  else if (!isUser && !message.isStreaming)
+                    MarkdownBody(
+                      data: message.content,
+                      softLineBreak: true,
+                      styleSheet: MarkdownStyleSheet(
+                        p: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: DesignTokens.textPrimary,
+                            ),
+                        strong: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: DesignTokens.textPrimary,
+                              fontWeight: FontWeight.bold,
+                            ),
+                        em: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: DesignTokens.textPrimary,
+                              fontStyle: FontStyle.italic,
+                            ),
+                        h3: Theme.of(context).textTheme.titleSmall?.copyWith(
+                              color: DesignTokens.textPrimary,
+                            ),
+                        listBullet: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: DesignTokens.textPrimary,
+                            ),
+                        blockSpacing: 6,
+                      ),
+                    )
+                  // User messages + streaming bot messages → plain text
                   else
                     Text(
                       message.content,
