@@ -2,10 +2,11 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'package:uuid/uuid.dart';
 import '../../core/api/api_client.dart';
+import '../../core/router/app_router.dart';
 import '../../core/store/app_store.dart';
 import '../../core/theme/design_tokens.dart';
 import '../../shared/models/persona.dart';
@@ -38,7 +39,23 @@ class _ChatPageState extends State<ChatPage> {
   String? _lastUserMsgId;
   String? _lastErrorBubbleId;
 
-  bool get _isBusy => _isThinking || _isStreaming;
+  // WEB-12: Energy Closure (US-L05) — Lay only
+  bool _energyClosure = false; // disables input for 5s after energy msg
+  Timer? _energyTimer;
+
+  static const _energyKeywords = [
+    'mệt mỏi', 'muốn nghỉ', 'muốn ngủ', 'đi ngủ', 'nghỉ ngơi',
+    'kiệt sức', 'muốn dừng', 'chán rồi', 'burnout', 'mệt lắm',
+    'cần ngủ', 'muốn nghỉ ngơi', 'thấy mệt', 'quá mệt',
+  ];
+
+  bool _detectEnergy(String text) {
+    if (_persona != Persona.lay) return false;
+    final lower = text.toLowerCase();
+    return _energyKeywords.any((k) => lower.contains(k));
+  }
+
+  bool get _isBusy => _isThinking || _isStreaming || _energyClosure;
 
   @override
   void initState() {
@@ -54,6 +71,7 @@ class _ChatPageState extends State<ChatPage> {
     _textCtrl.dispose();
     _scrollCtrl.dispose();
     _topicTimer?.cancel();
+    _energyTimer?.cancel();
     super.dispose();
   }
 
@@ -86,6 +104,9 @@ class _ChatPageState extends State<ChatPage> {
       _showQuotaEmpty();
       return;
     }
+
+    // WEB-12: detect energy closure keywords before sending
+    final isEnergyMsg = _detectEnergy(text);
 
     // Pre-consume token — refunded in all catch blocks below
     store.consumeToken();
@@ -126,6 +147,8 @@ class _ChatPageState extends State<ChatPage> {
         _isStreaming = false;
       });
       _scrollToBottom();
+      // WEB-12: trigger energy closure after Lay responds to a tired message
+      if (isEnergyMsg) _triggerEnergyClosure();
     } on ApiException catch (e) {
       if (!mounted) return;
       _resetBusyState();
@@ -310,6 +333,63 @@ class _ChatPageState extends State<ChatPage> {
       }
       rethrow; // propagate to _sendMessage catch block
     }
+  }
+
+  // ─────────────────────────────────────────
+  // WEB-12: ENERGY CLOSURE (US-L05)
+  // ─────────────────────────────────────────
+  void _triggerEnergyClosure() {
+    setState(() => _energyClosure = true);
+    _energyTimer?.cancel();
+    _energyTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted) return;
+      setState(() => _energyClosure = false);
+      _showEnergyClosureDialog();
+    });
+  }
+
+  void _showEnergyClosureDialog() {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(DesignTokens.radius2xl),
+        ),
+        contentPadding: const EdgeInsets.fromLTRB(24, 28, 24, 0),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('🌙', style: TextStyle(fontSize: 52)),
+            const SizedBox(height: DesignTokens.space12),
+            Text(
+              'oke bạn đi nghỉ đi nha',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: DesignTokens.space8),
+            Text(
+              'cơ thể cần nghỉ ngơi lắm rồi đó 🛌\nmình hẹn lại lần sau nha!',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: DesignTokens.textSecondary,
+                  ),
+            ),
+          ],
+        ),
+        actionsAlignment: MainAxisAlignment.center,
+        actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 20),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              context.go(AppRouter.chat);
+            },
+            child: const Text('Ngủ ngon 🌙'),
+          ),
+        ],
+      ),
+    );
   }
 
   // ─────────────────────────────────────────
@@ -739,31 +819,12 @@ class _MessageBubble extends StatelessWidget {
                   // Empty streaming bubble shows cursor only
                   if (message.content.isEmpty && message.isStreaming)
                     _StreamingCursor(color: personaColor)
-                  // WEB-11: completed bot message → render markdown
+                  // WEB-11: completed bot message → inline markdown renderer
                   else if (!isUser && !message.isStreaming)
-                    MarkdownBody(
-                      data: message.content,
-                      softLineBreak: true,
-                      styleSheet: MarkdownStyleSheet(
-                        p: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: DesignTokens.textPrimary,
-                            ),
-                        strong: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: DesignTokens.textPrimary,
-                              fontWeight: FontWeight.bold,
-                            ),
-                        em: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: DesignTokens.textPrimary,
-                              fontStyle: FontStyle.italic,
-                            ),
-                        h3: Theme.of(context).textTheme.titleSmall?.copyWith(
-                              color: DesignTokens.textPrimary,
-                            ),
-                        listBullet: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                              color: DesignTokens.textPrimary,
-                            ),
-                        blockSpacing: 6,
-                      ),
+                    _BotText(
+                      text: message.content,
+                      baseStyle: Theme.of(context).textTheme.bodyMedium
+                          ?.copyWith(color: DesignTokens.textPrimary),
                     )
                   // User messages + streaming bot messages → plain text
                   else
@@ -1004,6 +1065,92 @@ class _InputBar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+// ─────────────────────────────────────────
+// WEB-11: INLINE MARKDOWN RENDERER
+// Handles **bold**, *italic*, ### headers, - bullets, 1. numbered lists.
+// Zero dependencies — works identically on web and native.
+// ─────────────────────────────────────────
+class _BotText extends StatelessWidget {
+  final String text;
+  final TextStyle? baseStyle;
+
+  const _BotText({required this.text, this.baseStyle});
+
+  @override
+  Widget build(BuildContext context) {
+    final base = baseStyle ?? Theme.of(context).textTheme.bodyMedium ?? const TextStyle();
+    final lines = text.split('\n');
+    final widgets = <Widget>[];
+
+    for (int i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      if (i > 0) widgets.add(const SizedBox(height: 4));
+
+      if (line.startsWith('### ')) {
+        widgets.add(Text(line.substring(4),
+            style: base.copyWith(fontWeight: FontWeight.bold, fontSize: (base.fontSize ?? 14) + 2)));
+      } else if (line.startsWith('## ')) {
+        widgets.add(Text(line.substring(3),
+            style: base.copyWith(fontWeight: FontWeight.bold, fontSize: (base.fontSize ?? 14) + 4)));
+      } else if (line.startsWith('# ')) {
+        widgets.add(Text(line.substring(2),
+            style: base.copyWith(fontWeight: FontWeight.bold, fontSize: (base.fontSize ?? 14) + 6)));
+      } else if (line.startsWith('- ') || line.startsWith('* ')) {
+        widgets.add(Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('•  ', style: base),
+            Expanded(child: RichText(text: TextSpan(children: _parseInline(line.substring(2), base)))),
+          ],
+        ));
+      } else if (_isNumberedList(line)) {
+        final dotIdx = line.indexOf('. ');
+        widgets.add(Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('${line.substring(0, dotIdx + 1)}  ', style: base.copyWith(fontWeight: FontWeight.w600)),
+            Expanded(child: RichText(text: TextSpan(children: _parseInline(line.substring(dotIdx + 2), base)))),
+          ],
+        ));
+      } else if (line.isEmpty) {
+        widgets.add(const SizedBox(height: 4));
+      } else {
+        widgets.add(RichText(text: TextSpan(children: _parseInline(line, base))));
+      }
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: widgets);
+  }
+
+  bool _isNumberedList(String line) {
+    final match = RegExp(r'^\d+\. ').firstMatch(line);
+    return match != null;
+  }
+
+  List<InlineSpan> _parseInline(String text, TextStyle base) {
+    final spans = <InlineSpan>[];
+    // Match **bold** or *italic* or _italic_
+    final pattern = RegExp(r'\*\*(.+?)\*\*|\*(.+?)\*|_(.+?)_');
+    int lastEnd = 0;
+
+    for (final m in pattern.allMatches(text)) {
+      if (m.start > lastEnd) {
+        spans.add(TextSpan(text: text.substring(lastEnd, m.start), style: base));
+      }
+      if (m.group(1) != null) {
+        spans.add(TextSpan(text: m.group(1), style: base.copyWith(fontWeight: FontWeight.bold)));
+      } else {
+        spans.add(TextSpan(text: m.group(2) ?? m.group(3), style: base.copyWith(fontStyle: FontStyle.italic)));
+      }
+      lastEnd = m.end;
+    }
+    if (lastEnd < text.length) {
+      spans.add(TextSpan(text: text.substring(lastEnd), style: base));
+    }
+    return spans.isEmpty ? [TextSpan(text: text, style: base)] : spans;
   }
 }
 

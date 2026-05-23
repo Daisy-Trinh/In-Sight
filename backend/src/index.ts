@@ -431,11 +431,14 @@ export default {
         .map((h) => ({ role: h.role, content: h.content }));
 
       // Apply Soul Token Limiter (Bio_Soul §4.3 + API_Contract §4)
+      // Vietnamese text tokenises at ~1 char/token (not 1/4 like English).
+      // Word-count estimation: each Vietnamese word ≈ 1.5 tokens.
       let effectiveConfig = { ...config };
       if (config.tokenLimiterRatio) {
-        const inputTokenEstimate = Math.ceil(message.length / 4);
+        const wordCount = message.trim().split(/\s+/).filter(Boolean).length;
+        const inputTokenEstimate = Math.ceil(wordCount * 1.5);
         const limitedTokens = Math.max(
-          15,
+          10,
           Math.floor(inputTokenEstimate * config.tokenLimiterRatio),
         );
         effectiveConfig = { ...config, maxTokens: limitedTokens };
