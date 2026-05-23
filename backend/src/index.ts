@@ -117,10 +117,16 @@ function sseEvent(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+const JSON_HEADERS = {
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'X-App-Key, X-Anon-User-Id, Content-Type, Accept',
+};
+
 function errorResponse(code: string, message: string, status: number): Response {
   return new Response(
     JSON.stringify({ status: 'error', error: { code, message } }),
-    { status, headers: { 'Content-Type': 'application/json' } },
+    { status, headers: JSON_HEADERS },
   );
 }
 
@@ -372,7 +378,7 @@ export default {
     if (method === 'GET' && path === '/api/v1/health') {
       return new Response(
         JSON.stringify({ status: 'ok', version: '1.0.0', ts: Date.now() }),
-        { headers: { 'Content-Type': 'application/json' } },
+        { headers: JSON_HEADERS },
       );
     }
 
