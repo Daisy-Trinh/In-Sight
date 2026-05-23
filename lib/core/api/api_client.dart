@@ -7,9 +7,7 @@ import '../../shared/models/persona.dart';
 /// Base URL configurable via environment / build flavor.
 class ApiClient {
   static const _baseUrlDev = 'http://localhost:8787/api/v1';
-  // TODO: Update after `wrangler deploy` — replace YOUR_SUBDOMAIN with the
-  // value shown in wrangler output (e.g. "in-sight-api.myaccount.workers.dev")
-  static const _baseUrlProd = 'https://in-sight-api.YOUR_SUBDOMAIN.workers.dev/api/v1';
+  static const _baseUrlProd = 'https://in-sight-api.in-sight-duth.workers.dev/api/v1';
 
   final String baseUrl;
   final String appKey;
